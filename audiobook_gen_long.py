@@ -293,30 +293,11 @@ def wait_for_completion(operation_name, poll_interval=5):
         time.sleep(poll_interval)
 
 
-def get_oauth_token():
-    """Get OAuth2 access token using API key.
-    
-    Returns:
-        str: OAuth2 access token
-    """
-    if not GOOGLE_API_KEY:
-        raise ValueError("GOOGLE_API_KEY is not set.")
-    
-    url = "https://oauth2.googleapis.com/token"
-    data = {
-        "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
-        "assertion": GOOGLE_API_KEY
-    }
-    
-    response = requests.post(url, data=data)
-    if response.ok:
-        return response.json().get("access_token")
-    
-    raise ValueError("Could not obtain OAuth2 token. Please ensure GOOGLE_API_KEY is valid.")
-
-
 def download_from_gcs(gcs_uri, output_file):
     """Download audio file from Google Cloud Storage.
+    
+    Note: This requires the bucket to be publicly readable, or you need to use
+    gsutil or the gcloud CLI to download the file manually.
     
     Args:
         gcs_uri: GCS URI (gs://bucket/path)
@@ -332,22 +313,26 @@ def download_from_gcs(gcs_uri, output_file):
     bucket = parts[0]
     object_path = parts[1]
     
-    url = f"{GCS_BASE_URL}/storage/v1/b/{bucket}/o/{quote(object_path, safe='')}?alt=media"
+    url = f"{GCS_BASE_URL}/{bucket}/{quote(object_path, safe='/')}"
     
-    print(f"Downloading audio from GCS: {gcs_uri}")
+    print(f"Downloading audio from GCS...")
+    print(f"GCS URI: {gcs_uri}")
+    print(f"Note: If download fails, you may need to download manually using:")
+    print(f"  gsutil cp {gcs_uri} {output_file}")
+    print(f"  or make the bucket publicly readable")
     
     try:
-        if GOOGLE_API_KEY:
-            token = get_oauth_token()
-            headers = {"Authorization": f"Bearer {token}"}
-        else:
-            headers = {}
-        
-        response = requests.get(url, headers=headers, stream=True)
+        response = requests.get(url, stream=True)
         
         if not response.ok:
-            if response.status_code == 401:
-                raise ValueError("Authentication failed. Please check your GOOGLE_API_KEY or use service account credentials.")
+            if response.status_code == 403:
+                raise ValueError(
+                    f"Access denied. The bucket '{bucket}' is not publicly readable.\n"
+                    f"Please either:\n"
+                    f"1. Make the bucket publicly readable, or\n"
+                    f"2. Download manually using: gsutil cp {gcs_uri} {output_file}\n"
+                    f"3. Use service account credentials with gcloud CLI"
+                )
             print(f"Error downloading from GCS: {response.status_code}")
             print(f"Response: {response.text}")
             response.raise_for_status()
@@ -358,46 +343,24 @@ def download_from_gcs(gcs_uri, output_file):
         
         file_size = os.path.getsize(output_file)
         print(f"Audio downloaded to {output_file} ({file_size / 1024 / 1024:.2f} MB)")
-    except Exception as e:
-        print(f"Error: {e}")
-        print("Note: GCS download requires proper authentication.")
-        print("You may need to use service account credentials or make the bucket publicly readable.")
+    except requests.exceptions.RequestException as e:
+        print(f"Error downloading from GCS: {e}")
+        print(f"\nTo download manually, run:")
+        print(f"  gsutil cp {gcs_uri} {output_file}")
         raise
 
 
 def delete_from_gcs(gcs_uri):
     """Delete file from Google Cloud Storage.
     
+    Note: This requires proper authentication. Use gsutil for reliable deletion.
+    
     Args:
         gcs_uri: GCS URI (gs://bucket/path)
     """
-    if not gcs_uri.startswith("gs://"):
-        raise ValueError(f"Invalid GCS URI: {gcs_uri}")
-    
-    parts = gcs_uri[5:].split("/", 1)
-    if len(parts) != 2:
-        raise ValueError(f"Invalid GCS URI format: {gcs_uri}")
-    
-    bucket = parts[0]
-    object_path = parts[1]
-    
-    url = f"{GCS_BASE_URL}/storage/v1/b/{bucket}/o/{quote(object_path, safe='')}"
-    
-    try:
-        if GOOGLE_API_KEY:
-            token = get_oauth_token()
-            headers = {"Authorization": f"Bearer {token}"}
-        else:
-            headers = {}
-        
-        response = requests.delete(url, headers=headers)
-        
-        if response.ok:
-            print(f"Deleted file from GCS: {gcs_uri}")
-        else:
-            print(f"Warning: Could not delete file from GCS: {response.status_code}")
-    except Exception as e:
-        print(f"Warning: Could not delete file from GCS: {e}")
+    print(f"To delete the file from GCS, run:")
+    print(f"  gsutil rm {gcs_uri}")
+    print(f"Or delete it manually from the Google Cloud Console.")
 
 
 def convert_epub_to_audiobook_long(epub_path, output_file, bucket_name=None, keep_gcs=False):

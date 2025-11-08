@@ -20,6 +20,8 @@ GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or GOOGLE_API_KEY
 BASE_URL = "https://texttospeech.googleapis.com/v1"
 
+VOICE_NAME = "en-us-Chirp3-HD-Algenib"
+
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
 
@@ -34,14 +36,14 @@ def get_audio_extension(audio_format):
     }
     return extension_map.get(audio_format.lower(), ".wav")
 
-def synthesize_speech(text=None, ssml=None, markup=None, speaking_rate=1.0, voice_name="en-us-Chirp3-HD-Aoede", audio_format="wav"):
+def synthesize_speech(text=None, markup=None, speaking_rate=1.0, pace=None, voice_name=VOICE_NAME, audio_format="wav"):
     """Synthesize speech using REST API with API key.
     
     Args:
         text: Plain text input
-        ssml: SSML formatted input
         markup: Markup input with pause tags
         speaking_rate: Speech rate (0.25 to 2.0)
+        pace: Pace control for Chirp3-HD - "slow", "fast", "x-slow" (only for markup/text)
         voice_name: Voice name (default: en-us-Chirp3-HD-Leda)
         audio_format: Output format - "wav", "mp3", "ogg", "mulaw", "alaw" (default: "wav")
                      Note: MP3 uses default bitrate (API doesn't support bitrate control)
@@ -69,24 +71,34 @@ def synthesize_speech(text=None, ssml=None, markup=None, speaking_rate=1.0, voic
     url = f"{BASE_URL}/text:synthesize?key={GOOGLE_API_KEY}"
     
     input_data = {}
-    if ssml:
-        input_data["ssml"] = ssml
-    elif markup:
+    if markup:
         input_data["markup"] = markup
     elif text:
         input_data["text"] = text
     else:
-        raise ValueError("Must provide text, ssml, or markup")
+        raise ValueError("Must provide text or markup")
+    
+    voice_config = {
+        "languageCode": "en-US",
+        "name": voice_name,
+    }
+    
+    effective_rate = speaking_rate
+    if pace:
+        pace_rate_map = {
+            "slow": 0.9,
+            "x-slow": 0.7,
+            "fast": 1.5,
+        }
+        if pace in pace_rate_map:
+            effective_rate = pace_rate_map[pace]
     
     payload = {
         "input": input_data,
-        "voice": {
-            "languageCode": "en-US",
-            "name": voice_name,
-        },
+        "voice": voice_config,
         "audioConfig": {
             "audioEncoding": audio_encoding,
-            "speakingRate": speaking_rate,
+            "speakingRate": effective_rate,
         }
     }
     
@@ -138,11 +150,28 @@ def parse_epub(epub_path):
     book = epub.read_epub(epub_path)
     text_parts = []
     
+    exclude_patterns = ['toc.', 'nav.', '-toc', '-nav', 'contents.xhtml', 'index.xhtml']
+    
     for item in book.get_items():
         if item.get_type() == ebooklib.ITEM_DOCUMENT:
+            item_name = item.get_name().lower()
+            item_id = item.get_id().lower() if item.get_id() else ''
+            
+            print(f"Processing: {item.get_name()} (id: {item_id})")
+            
+            if any(pattern in item_name or pattern in item_id for pattern in exclude_patterns):
+                print(f"  -> Skipping (matched exclusion pattern)")
+                continue
+            
             soup = BeautifulSoup(item.get_content(), 'html.parser')
             text = soup.get_text(separator=' ', strip=True)
+            
+            if 'table of contents' in text.lower()[:200] or 'contents' in text.lower()[:100]:
+                print(f"  -> Skipping (detected TOC content)")
+                continue
+            
             if text:
+                print(f"  -> Including ({len(text)} chars)")
                 text_parts.append(text)
     
     combined_text = ' '.join(text_parts)
@@ -163,22 +192,33 @@ def clean_text_with_gemini(text, model_name="gemini-2.5-flash-lite"):
     if not GEMINI_API_KEY:
         raise ValueError("GEMINI_API_KEY is not set. Please set GEMINI_API_KEY environment variable.")
     
-    prompt = """Remove all content that should not be read aloud in an audiobook:
+    prompt = """
+You are a helpful assistant that pre-processes text for an audiobook.
+Your task is to remove all content that should not be read aloud in an audiobook, 
+and fix broken words coming from the OCR process.
+
+Remove all content like:
+- Table of contents entries
 - Page numbers
 - Image descriptions and alt text
 - Links and URLs
 - Footnote numbers and references
+- Footnotes
 - Table of contents entries
 - Headers and footers
 - Any navigation elements
+- Copyright notices
+- Ebook ISBN
+- Publisher information
+- Author information
+
 
 Keep only the actual readable text content that should be narrated. Return only the cleaned text, no explanations."""
     
-    max_chunk_tokens = 200000
+    max_chunk_tokens = 5000
     chunk_size = max_chunk_tokens * 3
     
     if len(text) <= chunk_size:
-        print("Cleaning text with Gemini...")
         model = genai.GenerativeModel(model_name)
         response = model.generate_content(prompt + "\n\nText to clean:\n" + text)
         time.sleep(4)
@@ -205,153 +245,118 @@ Keep only the actual readable text content that should be narrated. Return only 
     return ' '.join(cleaned_chunks)
 
 
-def text_to_ssml(text):
-    """Convert text to SSML format with natural pauses.
+def text_to_markup_with_gemini(text, model_name="gemini-2.5-flash-lite"):
+    """Convert text to markup format with natural pauses using Gemini.
     
     Args:
         text: Plain text to convert
+        model_name: Gemini model to use
         
     Returns:
-        str: SSML formatted text
+        str: Markup formatted text with pause tags
     """
-    paragraphs = re.split(r'\n\s*\n', text)
-    if len(paragraphs) == 1:
-        paragraphs = [text]
+    if not GEMINI_API_KEY:
+        raise ValueError("GEMINI_API_KEY is not set. Please set GEMINI_API_KEY environment variable.")
     
-    ssml_parts = ['<speak>']
-    max_sentence_length = 500
+    prompt = """Convert this text into natural audiobook narration markup. Follow these rules EXACTLY:
+
+1. Remove all quotes (", ', ", "), parentheses (), and braces {} from the text
+2. Replace em-dashes and en-dashes with spaces
+3. Add pause tags in EXACTLY this format - SINGLE square brackets ONLY:
+   - [pause short] after sentences or commas for brief pauses
+   - [pause] between paragraphs or scene changes
+   - [pause long] after chapter headings or major section breaks
+
+4. CRITICAL: Use SINGLE brackets [pause long] NOT double brackets [[pause long]]
+5. CRITICAL: Pause tags MUST be in square brackets like [pause] NOT "pause"
+6. Use pauses to create natural rhythm:
+   - After questions: [pause]
+   - Before dramatic reveals: [pause long]
+   - Between dialogue exchanges: [pause short]
+   - After exclamations: [pause short]
+   - After chapter titles: [pause long]
+
+7. Do NOT write the words "pause short" or "pause" as plain text - they MUST be in [brackets]
+8. Keep the text clean and readable for speech synthesis
+9. Preserve all actual content - only remove punctuation that would be read aloud
+10. Return ONLY the formatted text with pause tags, no explanations
+
+Example input: Chapter 1. "Hello," she said (quietly).
+Example output: Chapter 1 [pause long] Hello, she said quietly. [pause]
+
+WRONG: Chapter 1 pause long Hello, she said quietly pause
+WRONG: Chapter 1 [[pause long]] Hello, she said quietly [[pause]]
+RIGHT: Chapter 1 [pause long] Hello, she said quietly. [pause]
+
+Text to convert:
+"""
     
-    for para_idx, para in enumerate(paragraphs):
-        if not para.strip():
-            continue
-        para = para.strip()
-        
-        is_heading = (len(para) < 100 and 
-                     (para.isupper() or 
-                      re.match(r'^(Chapter|Part|Section|Book)\s+\d+', para, re.IGNORECASE) or
-                      re.match(r'^(Chapter|Part|Section|Book)\s+[IVXLCDM]+', para, re.IGNORECASE) or
-                      re.match(r'^\d+\.?\s*$', para)))
-        
-        ssml_parts.append('<p>')
-        
-        sentences = re.split(r'([.!?]+(?:\s+|$))', para)
-        sentences = [s for s in sentences if s.strip()]
-        
-        current_sentence = ''
-        for part in sentences:
-            current_sentence += part
-            if part.strip() and re.search(r'[.!?]\s*$', part.strip()):
-                sentence_text = current_sentence.strip()
-                if len(sentence_text) > max_sentence_length:
-                    words = sentence_text.split()
-                    current_words = []
-                    for word in words:
-                        test_sentence = ' '.join(current_words + [word])
-                        if len(test_sentence) > max_sentence_length and current_words:
-                            ssml_parts.append(f'<s>{" ".join(current_words)}</s>')
-                            current_words = [word]
-                        else:
-                            current_words.append(word)
-                    if current_words:
-                        ssml_parts.append(f'<s>{" ".join(current_words)}</s>')
-                else:
-                    ssml_parts.append(f'<s>{sentence_text}</s>')
-                current_sentence = ''
-        
-        if current_sentence.strip():
-            sentence_text = current_sentence.strip()
-            if len(sentence_text) > max_sentence_length:
-                words = sentence_text.split()
-                current_words = []
-                for word in words:
-                    test_sentence = ' '.join(current_words + [word])
-                    if len(test_sentence) > max_sentence_length and current_words:
-                        ssml_parts.append(f'<s>{" ".join(current_words)}</s>')
-                        current_words = [word]
-                    else:
-                        current_words.append(word)
-                if current_words:
-                    ssml_parts.append(f'<s>{" ".join(current_words)}</s>')
-            else:
-                ssml_parts.append(f'<s>{sentence_text}</s>')
-        
-        ssml_parts.append('</p>')
-        
-        if is_heading and para_idx < len(paragraphs) - 1:
-            ssml_parts.append('<p></p>')
+    max_chunk_tokens = 5000
+    chunk_size = max_chunk_tokens * 3
     
-    ssml_parts.append('</speak>')
-    return '\n'.join(ssml_parts)
+    if len(text) <= chunk_size:
+        model = genai.GenerativeModel(model_name)
+        response = model.generate_content(prompt + text)
+        time.sleep(4)
+        markup = response.text.strip()
+        if markup.startswith('"') and markup.endswith('"'):
+            markup = markup[1:-1]
+        #markup = fix_pause_tags(markup)
+        print(markup)
+        return markup
+    
+    print(f"Text is large, converting in chunks...")
+    markup_chunks = []
+    chunks = [text[i:i+chunk_size] for i in range(0, len(text), chunk_size)]
+    
+    model = genai.GenerativeModel(model_name)
+    for i, chunk in enumerate(chunks):
+        print(f"Converting chunk {i+1}/{len(chunks)}...")
+        response = model.generate_content(prompt + chunk)
+        markup = response.text.strip()
+        if markup.startswith('"') and markup.endswith('"'):
+            markup = markup[1:-1]
+        #markup = fix_pause_tags(markup)
+        markup_chunks.append(markup)
+        if i < len(chunks) - 1:
+            time.sleep(4)
+    
+    return ' '.join(markup_chunks)
 
 
-def chunk_content(ssml_text, max_chars=4000):
-    """Split SSML text into fixed-size chunks preserving paragraph structure.
+def chunk_content(formatted_text, max_chars=4000):
+    """Split formatted text into fixed-size chunks.
     
     Args:
-        ssml_text: SSML text to chunk
+        formatted_text: Markup text to chunk
         max_chars: Maximum characters per chunk
         
     Returns:
-        list: List of SSML chunk strings (each wrapped in <speak> tags)
+        list: List of chunk strings
     """
-    if not ssml_text.strip().startswith('<speak>'):
-        ssml_text = '<speak>' + ssml_text + '</speak>'
-    
-    inner_content = ssml_text.replace('<speak>', '').replace('</speak>', '').strip()
-    
-    paragraphs = re.findall(r'<p>.*?</p>', inner_content, re.DOTALL)
-    
-    if not paragraphs:
-        return [ssml_text]
+    sentences = re.split(r'(\[pause (?:short|long)\])', formatted_text)
+    sentences = [s for s in sentences if s.strip()]
     
     chunks = []
     current_chunk = []
     current_chunk_size = 0
     
-    for para in paragraphs:
-        para_size = len(para)
-        test_size = current_chunk_size + para_size + 20
+    for part in sentences:
+        part_size = len(part)
+        test_size = current_chunk_size + part_size
         
         if test_size > max_chars and current_chunk:
-            chunk_content = ''.join(current_chunk)
-            chunks.append('<speak>' + chunk_content + '</speak>')
-            current_chunk = [para]
-            current_chunk_size = para_size
-        elif para_size > max_chars:
-            if current_chunk:
-                chunk_content = ''.join(current_chunk)
-                chunks.append('<speak>' + chunk_content + '</speak>')
-                current_chunk = []
-                current_chunk_size = 0
-            
-            sentences = re.findall(r'<s>.*?</s>', para, re.DOTALL)
-            if sentences:
-                sub_chunk_sentences = []
-                sub_chunk_size = 0
-                for sentence in sentences:
-                    sentence_size = len(sentence)
-                    if sub_chunk_size + sentence_size + 20 > max_chars and sub_chunk_sentences:
-                        sub_chunk_content = '<p>' + ''.join(sub_chunk_sentences) + '</p>'
-                        chunks.append('<speak>' + sub_chunk_content + '</speak>')
-                        sub_chunk_sentences = [sentence]
-                        sub_chunk_size = sentence_size
-                    else:
-                        sub_chunk_sentences.append(sentence)
-                        sub_chunk_size += sentence_size
-                if sub_chunk_sentences:
-                    sub_chunk_content = '<p>' + ''.join(sub_chunk_sentences) + '</p>'
-                    chunks.append('<speak>' + sub_chunk_content + '</speak>')
-            else:
-                chunks.append('<speak>' + para + '</speak>')
+            chunks.append(''.join(current_chunk))
+            current_chunk = [part]
+            current_chunk_size = part_size
         else:
-            current_chunk.append(para)
-            current_chunk_size += para_size
+            current_chunk.append(part)
+            current_chunk_size += part_size
     
     if current_chunk:
-        chunk_content = ''.join(current_chunk)
-        chunks.append('<speak>' + chunk_content + '</speak>')
+        chunks.append(''.join(current_chunk))
     
-    return chunks if chunks else [ssml_text]
+    return chunks if chunks else [formatted_text]
 
 
 def concatenate_audio_files(audio_files, output_file):
@@ -393,20 +398,22 @@ def concatenate_audio_files(audio_files, output_file):
     print(f"Combined audio saved to {output_file}")
 
 
-def process_chunk(chunk_index, chunk, temp_dir):
-    """Process a single SSML chunk and generate audio.
+def process_chunk(chunk_index, chunk, temp_dir, pace=None):
+    """Process a single chunk and generate audio.
     
     Args:
         chunk_index: Index of the chunk
-        chunk: SSML chunk text
+        chunk: Markup chunk text
         temp_dir: Temporary directory for audio files
+        pace: Pace control (slow, fast, x-slow)
         
     Returns:
         tuple: (chunk_index, temp_file_path) or (chunk_index, None) if error
     """
     temp_file = os.path.join(temp_dir, f"chunk_{chunk_index:05d}.wav")
     try:
-        result = synthesize_speech(ssml=chunk)
+        print("chunk: ", chunk)
+        result = synthesize_speech(markup=chunk, pace=pace)
         save_audio(result, temp_file)
         return (chunk_index, temp_file)
     except Exception as e:
@@ -416,40 +423,57 @@ def process_chunk(chunk_index, chunk, temp_dir):
         return (chunk_index, None)
 
 
-def convert_epub_to_audiobook(epub_path, output_file):
+def convert_epub_to_audiobook(epub_path, output_file, pace=None, text_only=False):
     """Convert EPUB file to audiobook.
     
     Args:
         epub_path: Path to EPUB file
         output_file: Output audio file path
+        pace: Pace control for markup - "slow", "fast", "x-slow" (default: None)
+        use_gemini_markup: Use Gemini for intelligent markup conversion (default: True)
+        text_only: Only run text preprocessing without audio generation (default: False)
     """
-    print(f"Starting EPUB to audiobook conversion...")
+    print(f"Starting EPUB {'text preprocessing' if text_only else 'to audiobook conversion'}...")
     print(f"Input: {epub_path}")
-    print(f"Output: {output_file}")
+    if not text_only:
+        print(f"Output: {output_file}")
+    if pace:
+        print(f"Pace: {pace}")
     
     text = parse_epub(epub_path)
     
     print("Cleaning text with Gemini...")
     cleaned_text = clean_text_with_gemini(text)
     print(f"Cleaned text: {len(cleaned_text)} characters")
+
+    print("Converting to markup with Gemini (natural narration)...")
+    formatted_text = text_to_markup_with_gemini(cleaned_text)
+
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    epub_basename = os.path.splitext(os.path.basename(epub_path))[0]
+    debug_filename = f"{epub_basename}_{timestamp}_debug.txt"
+    with open(debug_filename, 'w', encoding='utf-8') as f:
+        f.write(formatted_text)
+    print(f"Debug text saved to: {debug_filename}")
     
-    print("Converting to SSML...")
-    ssml = text_to_ssml(cleaned_text)
+    if text_only:
+        print("Text preprocessing complete! Skipping audio generation.")
+        return
     
-    print("Chunking SSML for TTS...")
-    ssml_chunks = chunk_content(ssml, max_chars=3500)
-    print(f"Created {len(ssml_chunks)} chunks")
+    print("Chunking for TTS...")
+    chunks = chunk_content(formatted_text, max_chars=3500)
+    print(f"Created {len(chunks)} chunks")
     
     temp_dir = tempfile.mkdtemp()
     
     print("Generating audio in parallel...")
-    max_workers = min(10, len(ssml_chunks))
-    temp_audio_files = [None] * len(ssml_chunks)
+    max_workers = min(10, len(chunks))
+    temp_audio_files = [None] * len(chunks)
     
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {
-            executor.submit(process_chunk, i, chunk, temp_dir): i
-            for i, chunk in enumerate(ssml_chunks)
+            executor.submit(process_chunk, i, chunk, temp_dir, pace): i
+            for i, chunk in enumerate(chunks)
         }
         
         completed = 0
@@ -458,7 +482,7 @@ def convert_epub_to_audiobook(epub_path, output_file):
             completed += 1
             if temp_file:
                 temp_audio_files[chunk_index] = temp_file
-                print(f"Completed chunk {chunk_index + 1}/{len(ssml_chunks)}")
+                print(f"Completed chunk {chunk_index + 1}/{len(chunks)}")
             else:
                 print(f"Failed to process chunk {chunk_index + 1}")
                 raise Exception(f"Failed to generate audio for chunk {chunk_index + 1}")
@@ -481,9 +505,13 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Convert EPUB to audiobook")
     parser.add_argument("epub_path", help="Path to EPUB file")
     parser.add_argument("-o", "--output", default=None, help="Output audio file (default: book title)")
+    parser.add_argument("-p", "--pace", choices=["slow", "fast", "x-slow"], default=None,
+                       help="Reading speed: 'slow', 'fast', 'x-slow' (default: normal)")
+    parser.add_argument("--text-only", action="store_true",
+                       help="Only run text preprocessing without generating audio (saves debug file)")
     args = parser.parse_args()
     
-    if args.output is None:
+    if args.output is None and not args.text_only:
         title = get_epub_title(args.epub_path)
         if title:
             sanitized_title = re.sub(r'[<>:"/\\|?*]', '', title).strip()
@@ -493,5 +521,6 @@ if __name__ == "__main__":
         else:
             args.output = "output.wav"
     
-    convert_epub_to_audiobook(args.epub_path, args.output)
+    convert_epub_to_audiobook(args.epub_path, args.output, pace=args.pace, 
+                             text_only=args.text_only)
     
