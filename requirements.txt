@@ -1,0 +1,7 @@
+google-cloud-texttospeech>=2.16.0
+requests>=2.31.0
+python-dotenv>=1.0.0
+ebooklib>=0.18
+beautifulsoup4>=4.12.0
+google-generativeai>=0.3.0
+
